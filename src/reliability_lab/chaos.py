@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-import copy
+import concurrent.futures
 import json
 import random
 from pathlib import Path
@@ -8,7 +6,7 @@ from pathlib import Path
 from reliability_lab.cache import ResponseCache, SharedRedisCache
 from reliability_lab.circuit_breaker import CircuitBreaker
 from reliability_lab.config import LabConfig, ScenarioConfig
-from reliability_lab.gateway import ReliabilityGateway
+from reliability_lab.gateway import ReliabilityGateway, GatewayResponse
 from reliability_lab.metrics import RunMetrics
 from reliability_lab.providers import FakeLLMProvider
 
@@ -22,7 +20,11 @@ def load_queries(path: str | Path = "data/sample_queries.jsonl") -> list[str]:
     return queries
 
 
-def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None = None) -> ReliabilityGateway:
+def build_gateway(
+    config: LabConfig,
+    provider_overrides: dict[str, float] | None = None,
+    cache_threshold_override: float | None = None,
+) -> ReliabilityGateway:
     providers = []
     for p in config.providers:
         fail_rate = provider_overrides.get(p.name, p.fail_rate) if provider_overrides else p.fail_rate
@@ -38,14 +40,15 @@ def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None
     }
     cache: ResponseCache | SharedRedisCache | None = None
     if config.cache.enabled:
+        threshold = cache_threshold_override if cache_threshold_override is not None else config.cache.similarity_threshold
         if config.cache.backend == "redis":
             cache = SharedRedisCache(
                 config.cache.redis_url,
                 config.cache.ttl_seconds,
-                config.cache.similarity_threshold,
+                threshold,
             )
         else:
-            cache = ResponseCache(config.cache.ttl_seconds, config.cache.similarity_threshold)
+            cache = ResponseCache(config.cache.ttl_seconds, threshold)
     return ReliabilityGateway(providers, breakers, cache)
 
 
@@ -57,10 +60,11 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     """
     recovery_times: list[float] = []
     for breaker in gateway.breakers.values():
+        # Track multiple open/close cycles
         open_ts: float | None = None
         for entry in breaker.transition_log:
-            if entry["to"] == "open" and open_ts is None:
-                open_ts = entry["ts"]
+            if entry["to"] == "open":
+                open_ts = float(entry["ts"])
             elif entry["to"] == "closed" and open_ts is not None:
                 recovery_times.append((float(entry["ts"]) - open_ts) * 1000)
                 open_ts = None
@@ -71,18 +75,26 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
     """Run a single named chaos scenario."""
-    gateway = build_gateway(config, scenario.provider_overrides or None)
+    gateway = build_gateway(config, scenario.provider_overrides or None, scenario.cache_threshold_override)
     metrics = RunMetrics()
     request_count = config.load_test.requests
-    for _ in range(request_count):
+    concurrency = config.load_test.concurrency
+
+    def single_request(_: int) -> GatewayResponse:
         prompt = random.choice(queries)
-        result = gateway.complete(prompt)
+        return gateway.complete(prompt)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        results = list(executor.map(single_request, range(request_count)))
+
+    for result in results:
         metrics.total_requests += 1
         metrics.estimated_cost += result.estimated_cost
         if result.cache_hit:
             metrics.cache_hits += 1
             metrics.estimated_cost_saved += 0.001
-        if result.route == "fallback":
+        
+        if "fallback" in result.route and "static" not in result.route:
             metrics.fallback_successes += 1
             metrics.successful_requests += 1
         elif result.route == "static_fallback":
@@ -90,6 +102,7 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
             metrics.failed_requests += 1
         else:
             metrics.successful_requests += 1
+        
         if result.latency_ms:
             metrics.latencies_ms.append(result.latency_ms)
 
@@ -101,11 +114,7 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
-    """Run all named scenarios from config, or a default run if none defined.
-
-    TODO(student): Add a cache vs no-cache comparison scenario.
-    Extend with your own custom scenarios (e.g., cost cap near limit).
-    """
+    """Run all named scenarios from config, or a default run if none defined."""
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
         metrics = run_scenario(config, queries, default_scenario)
@@ -116,9 +125,20 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     for scenario in config.scenarios:
         result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        # Define pass/fail criteria per scenario
+        passed = False
+        if scenario.name == "primary_timeout_100":
+            # Passes if availability is high despite primary failure
+            passed = (result.successful_requests / result.total_requests) > 0.9
+        elif scenario.name == "primary_flaky_50":
+            # Passes if we have some circuit open events and still maintain availability
+            passed = result.circuit_open_count > 0 and (result.successful_requests / result.total_requests) > 0.7
+        elif scenario.name == "cache_stale_candidate":
+            # Passes if cache hits occurred
+            passed = result.cache_hits > 0
+        else:
+            passed = result.successful_requests > 0
+
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests

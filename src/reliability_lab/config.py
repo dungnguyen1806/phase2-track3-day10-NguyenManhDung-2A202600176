@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore
 from pydantic import BaseModel, Field
 
 
@@ -30,12 +30,14 @@ class CacheConfig(BaseModel):
 
 class LoadTestConfig(BaseModel):
     requests: int = Field(gt=0)
+    concurrency: int = Field(default=1, gt=0)
 
 
 class ScenarioConfig(BaseModel):
     name: str
     description: str = ""
     provider_overrides: dict[str, float] = Field(default_factory=dict)
+    cache_threshold_override: float | None = None
 
 
 class LabConfig(BaseModel):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -20,13 +21,7 @@ class CircuitOpenError(RuntimeError):
 
 @dataclass(slots=True)
 class CircuitBreaker:
-    """Circuit breaker skeleton.
-
-    TODO(student): Implement a production-safe state machine:
-    - CLOSED: calls pass through; count failures.
-    - OPEN: fail fast until reset timeout elapses.
-    - HALF_OPEN: allow a probe; close on success or re-open on failure.
-    """
+    """Circuit breaker skeleton."""
 
     name: str
     failure_threshold: int
@@ -37,19 +32,17 @@ class CircuitBreaker:
     success_count: int = 0
     opened_at: float | None = None
     transition_log: list[dict[str, str | float]] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def allow_request(self) -> bool:
-        """Return whether a request should be attempted.
-
-        TODO(student): Return False when OPEN and timeout has not elapsed.
-        When timeout elapsed, transition to HALF_OPEN and allow one probe.
-        """
-        if self.state == CircuitState.OPEN:
-            if self.opened_at is not None and time.monotonic() - self.opened_at >= self.reset_timeout_seconds:
-                self._transition(CircuitState.HALF_OPEN, "reset_timeout_elapsed")
-                return True
-            return False
-        return True
+        """Return whether a request should be attempted."""
+        with self._lock:
+            if self.state == CircuitState.OPEN:
+                if self.opened_at is not None and time.monotonic() - self.opened_at >= self.reset_timeout_seconds:
+                    self._transition(CircuitState.HALF_OPEN, "reset_timeout_elapsed")
+                    return True
+                return False
+            return True
 
     def call(self, fn: Callable[..., T], *args: object, **kwargs: object) -> T:
         """Call a function through the circuit breaker."""
@@ -58,28 +51,36 @@ class CircuitBreaker:
         try:
             result = fn(*args, **kwargs)
         except Exception:
-            self.record_failure()
+            with self._lock:
+                self.record_failure()
             raise
-        self.record_success()
+        with self._lock:
+            self.record_success()
         return result
 
     def record_success(self) -> None:
         """Record success and close from HALF_OPEN if enough probes pass."""
-        # TODO(student): refine success threshold handling and counters.
-        self.failure_count = 0
         self.success_count += 1
-        if self.state == CircuitState.HALF_OPEN and self.success_count >= self.success_threshold:
-            self._transition(CircuitState.CLOSED, "probe_success")
-            self.success_count = 0
+        if self.state == CircuitState.HALF_OPEN:
+            if self.success_count >= self.success_threshold:
+                self._transition(CircuitState.CLOSED, "probe_success")
+                self.failure_count = 0
+                self.success_count = 0
+        else:
+            # In CLOSED state, we just reset failure count
+            self.failure_count = 0
 
     def record_failure(self) -> None:
         """Record failure and open when threshold is reached."""
-        # TODO(student): handle HALF_OPEN failure explicitly and reset success counter.
         self.failure_count += 1
         self.success_count = 0
-        if self.state == CircuitState.HALF_OPEN or self.failure_count >= self.failure_threshold:
-            self._transition(CircuitState.OPEN, "failure_threshold")
+        if self.state == CircuitState.HALF_OPEN:
+            self._transition(CircuitState.OPEN, "half_open_failure")
             self.opened_at = time.monotonic()
+        elif self.state == CircuitState.CLOSED:
+            if self.failure_count >= self.failure_threshold:
+                self._transition(CircuitState.OPEN, "failure_threshold_reached")
+                self.opened_at = time.monotonic()
 
     def _transition(self, new_state: CircuitState, reason: str) -> None:
         if self.state == new_state:
